@@ -124,85 +124,75 @@ class YapeOCRApp:
         threading.Thread(target=self.animate_loading, daemon=True).start()
         threading.Thread(target=self.process_image, args=(file_path,), daemon=True).start()
 
+    def extract_codigo_logic(self, text):
+        """Lógica común para extraer los 3 dígitos del código de seguridad."""
+        text_upper = text.upper().replace('¡', '').replace('!', '')
+        keywords = ["SEGURIDAD", "CÓDIGO", "CODIGO", "S3GURIDAD", "SECU", "S3GU", "CURIDAD"]
+        target_index = -1
+        for kw in keywords:
+            target_index = text_upper.find(kw)
+            if target_index != -1: break
+        
+        if target_index != -1:
+            end_index = text_upper.find("DATOS", target_index)
+            if end_index == -1: end_index = target_index + 120
+            section = text[target_index:end_index]
+            all_digits = re.sub(r'\D', '', section)
+            if len(all_digits) >= 3:
+                return all_digits[-3:]
+            # Fallback a búsqueda de dígitos dispersos
+            matches = re.findall(r'\d', section)
+            if len(matches) >= 3:
+                return "".join(matches[-3:])
+        return "No encontrado"
+
     def process_image(self, image_path):
         try:
             if self.reader is None:
                 print("Cargando modelos OCR...")
                 self.reader = easyocr.Reader(['es'])
             
-            # --- Pre-procesamiento de Alta Sensibilidad ---
-            img = Image.open(image_path).convert('RGB')
-            w, h = img.size
-            img = img.resize((w*2, h*2), Image.Resampling.BICUBIC)
-            
-            img_gray = ImageOps.grayscale(img)
-            # Ecualización para balancear luces y sombras (ayuda mucho a las cajas)
-            img_gray = ImageOps.equalize(img_gray)
-            
-            img_sharp = ImageEnhance.Sharpness(img_gray).enhance(2.0)
-            img_enhanced = ImageEnhance.Contrast(img_sharp).enhance(1.2) # Menos contraste, más detalle
-            
-            temp_path = "temp_ocr_process.jpg"
-            img_enhanced.save(temp_path)
+            # --- Modo 1: Sensibilidad Estándar (Mejor para montos) ---
+            img_raw = Image.open(image_path).convert('RGB')
+            w, h = img_raw.size
+            img_resize = img_raw.resize((w*2, h*2), Image.Resampling.BICUBIC)
+            img_gray = ImageOps.grayscale(img_resize)
+            img_standard = ImageEnhance.Contrast(img_gray).enhance(1.8)
+            img_standard.save("temp_standard.jpg")
 
-            # Umbrales bajísimos para capturar cajas grises
-            result = self.reader.readtext(temp_path, detail=0, paragraph=False, 
-                                        width_ths=0.2, text_threshold=0.2, 
-                                        low_text=0.1, contrast_ths=0.1)
-            
-            if os.path.exists(temp_path): os.remove(temp_path)
-            
+            result = self.reader.readtext("temp_standard.jpg", detail=0, paragraph=False, width_ths=0.2)
             full_text = " ".join(result)
-            print("Texto detectado:", full_text)
-            text_upper = full_text.upper().replace('¡', '').replace('!', '')
+            print("Escaneo 1 (Standard):", full_text)
             
-            # --- Monto ---
+            # 1. Extraer Monto (Suele salir bien en standard)
             monto = "No encontrado"
+            text_upper = full_text.upper().replace('¡', '').replace('!', '')
             ref_index = text_upper.find("YAPEASTE")
             search_text = full_text[ref_index:] if ref_index != -1 else full_text
+            monto_matches = list(re.finditer(r'(?<![0-9])[S5s][/\s\.\-Il]{1,4}\s*([0-9IlioOB\.,]{1,10})', search_text))
+            if monto_matches:
+                raw_val = monto_matches[0].group(1)
+                monto = raw_val.replace('l', '1').replace('I', '1').replace('o', '0').replace('O', '0').replace('B', '8')
+                monto = re.sub(r'[^0-9\.,]', '', monto)
             
-            candidates = []
-            monto_matches = re.finditer(r'(?<![0-9])[S5s][/\s\.\-Il]{1,4}\s*([0-9IlioOB\.,]{1,10})', search_text)
-            
-            for match in monto_matches:
-                raw_val = match.group(1)
-                clean_val = raw_val.replace('l', '1').replace('I', '1').replace('i', '1').replace('o', '0').replace('O', '0').replace('B', '8')
-                clean_val = re.sub(r'[^0-9\.,]', '', clean_val)
-                if clean_val and any(char.isdigit() for char in clean_val):
-                    if re.match(r'^\d+([\.,]\d{1,2})?$', clean_val):
-                        candidates.append(clean_val)
-            
-            if candidates:
-                monto = candidates[0]
-            elif ref_index != -1:
-                near = re.search(r'(\d+([\.,]\d{1,2})?)', search_text[:50])
-                if near: monto = near.group(1)
+            # 2. Extraer Código (Primer intento)
+            codigo = self.extract_codigo_logic(full_text)
 
-            # --- Código de Seguridad ---
-            codigo = "No encontrado"
-            keywords = ["SEGURIDAD", "CÓDIGO", "CODIGO", "S3GURIDAD", "SECU", "S3GU", "CURIDAD"]
-            target_index = -1
-            for kw in keywords:
-                target_index = text_upper.find(kw)
-                if target_index != -1: break
-            
-            if target_index != -1:
-                # Delimitar sección (desde SEGURIDAD hasta DATOS de transacción)
-                # El icono (i) a veces se lee como '1' o '2', por eso tomamos los ÚLTIMOS 3 dígitos
-                end_index = text_upper.find("DATOS", target_index)
-                if end_index == -1: end_index = target_index + 100
-                
-                section = full_text[target_index:end_index]
-                all_digits = re.sub(r'\D', '', section)
-                
-                if len(all_digits) >= 3:
-                    # Siempre son los últimos 3 del bloque de seguridad (el icono i va primero)
-                    codigo = all_digits[-3:]
-                else:
-                    # Fallback si están muy separados
-                    matches = re.findall(r'\d', section)
-                    if len(matches) >= 3:
-                        codigo = "".join(matches[-3:])
+            # --- Modo 2: Binarización Agresiva (Específico para cajas grises) ---
+            if codigo == "No encontrado":
+                print("Intentando Modo Binarización para el código...")
+                # Umbral: Todo lo que NO sea blanco casi puro se vuelve NEGRO
+                # Esto incluye los cuadros grises y los números.
+                img_bin = img_gray.point(lambda p: 0 if p < 210 else 255) 
+                img_bin.save("temp_bin.jpg")
+                result_bin = self.reader.readtext("temp_bin.jpg", detail=0, width_ths=0.4)
+                text_bin = " ".join(result_bin)
+                print("Escaneo 2 (Binario):", text_bin)
+                codigo = self.extract_codigo_logic(text_bin)
+
+            # --- Limpieza Final ---
+            for f in ["temp_standard.jpg", "temp_bin.jpg"]:
+                if os.path.exists(f): os.remove(f)
 
             self.root.after(0, lambda: self.update_results(monto, codigo))
         except Exception as e:
@@ -214,12 +204,12 @@ class YapeOCRApp:
     def update_results(self, monto, codigo):
         self.monto_text.set(monto)
         self.codigo_text.set(codigo)
-        print(f"Resultados -> Monto: {monto}, Código: {codigo}")
+        print(f"Resultados Finales -> Monto: {monto}, Código: {codigo}")
 
     def show_error(self, message):
         self.monto_text.set("ERROR")
         self.codigo_text.set("ERROR")
-        print(f"Error: {message}")
+        print(f"Error Crítico: {message}")
 
 if __name__ == "__main__":
     root = tk.Tk()
